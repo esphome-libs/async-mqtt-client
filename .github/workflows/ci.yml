@@ -24,6 +24,8 @@ jobs:
           - name: ESP32
             board: esp32dev
             example: examples/FullyFeatured-ESP32
+            # AsyncTCP-esphome needs Arduino 2.x (IPv6Address.h)
+            options: -O "platform=espressif32@^6.10.0"
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -49,4 +51,7 @@ jobs:
         run: pio package pack --output /tmp
 
       - name: Build ${{ matrix.name }} example
-        run: python -m platformio ci -l . --board ${{ matrix.board }} ${{ matrix.example }}
+        # strict: skip dependencies declared for another platform
+        run: >-
+          python -m platformio ci -l . --board ${{ matrix.board }}
+          -O "lib_compat_mode=strict" ${{ matrix.options }} ${{ matrix.example }}
