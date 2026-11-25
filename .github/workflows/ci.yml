@@ -45,7 +45,8 @@ jobs:
             pio-${{ runner.os }}-
 
       - name: Install PlatformIO
-        run: pip install platformio
+        # esptool from espressif32 6.x needs intelhex in the PlatformIO Python
+        run: pip install platformio intelhex
 
       - name: Validate PlatformIO package metadata
         run: pio package pack --output /tmp
