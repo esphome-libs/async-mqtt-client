@@ -142,4 +142,6 @@ void setup() {
 }
 
 void loop() {
+  // Flushes buffered TLS records and runs the keepalive on ESP8266
+  mqttClient.loop();
 }

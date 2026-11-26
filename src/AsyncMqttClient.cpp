@@ -1,5 +1,25 @@
 #include "AsyncMqttClient.hpp"
 
+#if defined(ESP8266) && ASYNC_TCP_SSL_ENABLED && ASYNC_TCP_SSL_BEARSSL
+#include <bearssl/bearssl_x509.h>
+
+namespace {
+constexpr int MQTT_TLS_IN_BUF_SIZE = 4421;
+constexpr int MQTT_TLS_OUT_BUF_SIZE = 1349;
+
+// Without pins any server certificate is accepted, as with axTLS
+SSL_CTX_PARAMS makeSslParams(const uint8_t* fingerprint) {
+  SSL_CTX_PARAMS sslParams{};
+  sslParams.use_insecure = true;
+  sslParams.use_fingerprint = fingerprint != nullptr;
+  sslParams.iobuf_in_size = MQTT_TLS_IN_BUF_SIZE;
+  sslParams.iobuf_out_size = MQTT_TLS_OUT_BUF_SIZE;
+  if (fingerprint != nullptr) memcpy(sslParams.fingerprint, fingerprint, SHA1_SIZE);
+  return sslParams;
+}
+}
+#endif
+
 AsyncMqttClient::AsyncMqttClient()
 : _connected(false)
 , _connectPacketNotEnoughSpace(false)
@@ -159,6 +179,7 @@ void AsyncMqttClient::_freeCurrentParsedPacket() {
 }
 
 void AsyncMqttClient::_clear() {
+  _disconnecting = false;
   _lastPingRequestTime = 0;
   _connected = false;
   _disconnectOnPoll = false;
@@ -180,7 +201,7 @@ void AsyncMqttClient::_clear() {
 void AsyncMqttClient::_onConnect(AsyncClient* client) {
   (void)client;
 
-#if ASYNC_TCP_SSL_ENABLED
+#if ASYNC_TCP_SSL_ENABLED && !(defined(ESP8266) && ASYNC_TCP_SSL_BEARSSL)
   if (_secure && _secureServerFingerprints.size() > 0) {
     SSL* clientSsl = _client.getSSL();
 
@@ -324,7 +345,7 @@ void AsyncMqttClient::_onConnect(AsyncClient* client) {
   sendbuffer[3] = 'Q';
   sendbuffer[4] = 'T';
   sendbuffer[5] = 'T';
-  
+
   sendbuffer[6] = protocolLevel[0];
   sendbuffer[7] = connectFlags[0];
   sendbuffer[8] = keepAliveBytes[0];
@@ -356,6 +377,14 @@ void AsyncMqttClient::_onConnect(AsyncClient* client) {
 }
 
 void AsyncMqttClient::_onDisconnect(AsyncClient* client) {
+#if defined(ESP8266)
+  // A callback run while parsing closed the transport; finish after parsing unwinds.
+  // ESP8266 only: elsewhere the transport runs its callbacks on another task.
+  if (_parsing) {
+    _disconnectDeferred = true;
+    return;
+  }
+#endif
   (void)client;
   AsyncMqttClientDisconnectReason reason;
 
@@ -374,7 +403,15 @@ void AsyncMqttClient::_onDisconnect(AsyncClient* client) {
 
 void AsyncMqttClient::_onError(AsyncClient* client, int8_t error) {
   (void)client;
+#if defined(ESP8266) && ASYNC_TCP_SSL_ENABLED && ASYNC_TCP_SSL_BEARSSL
+  // The pin verifier rejects a certificate with BR_ERR_X509_NOT_TRUSTED
+  if (_secure && !_secureServerFingerprints.empty() && error == BR_ERR_X509_NOT_TRUSTED) {
+    _tlsBadFingerprint = true;
+    _fingerprintIndex = (_fingerprintIndex + 1) % _secureServerFingerprints.size();
+  }
+#else
   (void)error;
+#endif
   // _onDisconnect called anyway
 }
 
@@ -391,8 +428,15 @@ void AsyncMqttClient::_onAck(AsyncClient* client, size_t len, uint32_t time) {
 }
 
 void AsyncMqttClient::_onData(AsyncClient* client, uint8_t* data, size_t len) {
-  (void)client;
   size_t currentBytePosition = 0;
+#if defined(ESP8266)
+  // The transport hands over the rest of a received chain even after a callback closed it;
+  // not connected(), which is false in CLOSE_WAIT while the broker's last bytes arrive
+  if (client->disconnected()) return;
+  _parsing = true;
+#else
+  (void)client;
+#endif
   uint8_t currentByte;
   do {
     switch (_parsingInformation.bufferState) {
@@ -458,14 +502,25 @@ void AsyncMqttClient::_onData(AsyncClient* client, uint8_t* data, size_t len) {
       default:
         currentBytePosition = len;
     }
+#if defined(ESP8266)
+  } while (currentBytePosition != len && !_disconnectDeferred);
+  _parsing = false;
+  if (_disconnectDeferred) {
+    _disconnectDeferred = false;
+    _onDisconnect(client);
+  }
+#else
   } while (currentBytePosition != len);
+#endif
 }
 
 void AsyncMqttClient::_onPoll(AsyncClient* client) {
-  if (!_connected) return;
+  if (!_connected || _disconnecting) return;
 
+  if (_keepAlive == 0) {
+    // Keepalive off (MQTT 3.1.1, 3.1.2.10): no pings and no ping timeout
   // if there is too much time the client has sent a ping request without a response, disconnect client to avoid half open connections
-  if (_lastPingRequestTime != 0 && (millis() - _lastPingRequestTime) >= (_keepAlive * 1000 * 2)) {
+  } else if (_lastPingRequestTime != 0 && (millis() - _lastPingRequestTime) >= (_keepAlive * 1000 * 2)) {
     disconnect();
     return;
   // send ping to ensure the server will receive at least one message inside keepalive window
@@ -618,6 +673,19 @@ void AsyncMqttClient::_onPubComp(uint16_t packetId) {
   for (auto callback : _onPublishUserCallbacks) callback(packetId);
 }
 
+void AsyncMqttClient::loop() {
+#if defined(ESP8266) && ASYNC_TCP_SSL_ENABLED
+  // Flushes TLS records between transport polls. ESP8266 only: other transports run
+  // callbacks on their own task. Plain connections need no help, and a no-op
+  // send() there would keep resetting the ack timeout.
+  if (!_secure || !_client.connected()) return;
+  _client.send();
+  _onPoll(&_client);
+  // _onPoll can close the connection
+  if (_client.connected()) _client.send();
+#endif
+}
+
 bool AsyncMqttClient::_sendPing() {
   char fixedHeader[2];
   fixedHeader[0] = AsyncMqttClientInternals::PacketType.PINGREQ;
@@ -632,6 +700,8 @@ bool AsyncMqttClient::_sendPing() {
 
   _client.add(fixedHeader, 2);
   _client.send();
+  // A failed TLS write already tore the connection down and cleared the ping state
+  if (!_connected) { SEMAPHORE_GIVE(); return false; }
   _lastClientActivity = millis();
   _lastPingRequestTime = millis();
 
@@ -640,6 +710,8 @@ bool AsyncMqttClient::_sendPing() {
 }
 
 void AsyncMqttClient::_sendAcks() {
+  // Nothing more goes out once a partial publish has stopped writes
+  if (!_connected || _disconnecting) return;
   uint8_t neededAckSpace = 2 + 2;
 
   SEMAPHORE_TAKE();
@@ -661,6 +733,8 @@ void AsyncMqttClient::_sendAcks() {
     _client.add(fixedHeader, 2);
     _client.add(packetIdBytes, 2);
     _client.send();
+    // A failed write can tear the connection down, which empties the queue
+    if (!_connected) break;
 
     _toSendAcks.erase(_toSendAcks.begin() + i);
     _toSendAcks.shrink_to_fit();
@@ -671,7 +745,7 @@ void AsyncMqttClient::_sendAcks() {
 }
 
 bool AsyncMqttClient::_sendDisconnect() {
-  if (!_connected) return true;
+  if (!_connected || _disconnecting) return true;
 
   const uint8_t neededSpace = 2;
 
@@ -687,7 +761,17 @@ bool AsyncMqttClient::_sendDisconnect() {
 
   _client.add(fixedHeader, 2);
   _client.send();
+  // A failed write already tore the connection down; while parsing, onDisconnect is
+  // deferred, so check the transport too
+  if (!_connected || _client.disconnected()) { SEMAPHORE_GIVE(); return true; }
+#if defined(ESP8266)
+  // Graceful: the transport sends TLS records still buffered before it closes.
+  // Stay connected until it does, but nothing more goes out after DISCONNECT.
+  _disconnecting = true;
+  _client.close(false);
+#else
   _client.close(true);
+#endif
 
   _disconnectOnPoll = false;
 
@@ -711,6 +795,18 @@ bool AsyncMqttClient::connected() const {
 void AsyncMqttClient::connect() {
   if (_connected) return;
 
+#if defined(ESP8266) && ASYNC_TCP_SSL_ENABLED && ASYNC_TCP_SSL_BEARSSL
+  if (_secure) {
+    const uint8_t* fingerprint = nullptr;
+    if (!_secureServerFingerprints.empty()) {
+      if (_fingerprintIndex >= _secureServerFingerprints.size()) _fingerprintIndex = 0;
+      fingerprint = _secureServerFingerprints[_fingerprintIndex].data();
+    }
+    SSL_CTX_PARAMS sslParams = makeSslParams(fingerprint);
+    _client.setSSLParams(sslParams);
+  }
+#endif
+
 #if ASYNC_TCP_SSL_ENABLED
   if (_useIp) {
     _client.connect(_ip, _port, _secure);
@@ -732,13 +828,13 @@ void AsyncMqttClient::disconnect(bool force) {
   if (force) {
     _client.close(true);
   } else {
-    _sendDisconnect();
-    _disconnectOnPoll = false;
+    // No room for DISCONNECT yet (e.g. right after a large publish): retry from poll
+    _disconnectOnPoll = !_sendDisconnect();
   }
 }
 
 uint16_t AsyncMqttClient::subscribe(const char* topic, uint8_t qos) {
-  if (!_connected) return 0;
+  if (!_connected || _disconnecting) return 0;
 
   char fixedHeader[5];
   fixedHeader[0] = AsyncMqttClientInternals::PacketType.SUBSCRIBE;
@@ -783,7 +879,7 @@ uint16_t AsyncMqttClient::subscribe(const char* topic, uint8_t qos) {
 }
 
 uint16_t AsyncMqttClient::unsubscribe(const char* topic) {
-  if (!_connected) return 0;
+  if (!_connected || _disconnecting) return 0;
 
   char fixedHeader[5];
   fixedHeader[0] = AsyncMqttClientInternals::PacketType.UNSUBSCRIBE;
@@ -823,7 +919,7 @@ uint16_t AsyncMqttClient::unsubscribe(const char* topic) {
 }
 
 uint16_t AsyncMqttClient::publish(const char* topic, uint8_t qos, bool retain, const char* payload, size_t length, bool dup, uint16_t message_id) {
-  if (!_connected) return 0;
+  if (!_connected || _disconnecting) return 0;
 
   char fixedHeader[5];
   fixedHeader[0] = AsyncMqttClientInternals::PacketType.PUBLISH;
@@ -877,11 +973,42 @@ uint16_t AsyncMqttClient::publish(const char* topic, uint8_t qos, bool retain, c
     packetIdBytes[1] = packetId & 0xFF;
   }
 
-  _client.add(fixedHeader, 1 + remainingLengthLength);
-  _client.add(topicLengthBytes, 2);
-  _client.add(topic, topicLength);
-  if (qos != 0) _client.add(packetIdBytes, 2);
-  if (payload != nullptr) _client.add(payload, payloadLength);
+  // The fields share one TLS record: the transport only seals a record when it is full or on send()
+#if defined(ESP8266)
+  // The ESP8266 transport keeps a reference to the data unless asked to copy it
+  auto add = [this](const char* data, size_t len) { return _client.add(data, len, ASYNC_WRITE_FLAG_COPY); };
+#else
+  auto add = [this](const char* data, size_t len) { return _client.add(data, len); };
+#endif
+  // Stop at the first short write so no field is queued without the ones before it
+  size_t added = 0;
+  bool complete = true;
+  auto put = [&](const char* data, size_t len) {
+    if (!complete) return;
+    size_t taken = add(data, len);
+    added += taken;
+    complete = taken == len;
+  };
+  put(fixedHeader, 1 + remainingLengthLength);
+  put(topicLengthBytes, 2);
+  put(topic, topicLength);
+  if (qos != 0) put(packetIdBytes, 2);
+  if (payload != nullptr) put(payload, payloadLength);
+#if defined(ESP8266)
+  if (added != neededSpace) {
+    // A partly queued packet corrupts the stream: stop writing and close
+    // from the next poll, as this may run inside a message callback
+    // A write that tore the connection down already ran _onDisconnect()
+    if (added != 0 && _client.connected()) {
+      _disconnecting = true;
+      _client.close();
+    }
+    SEMAPHORE_GIVE();
+    return 0;
+  }
+#else
+  (void)added;
+#endif
   _client.send();
   _lastClientActivity = millis();
 

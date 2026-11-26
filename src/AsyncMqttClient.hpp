@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <functional>
 #include <vector>
 
@@ -19,8 +20,11 @@
 #error Platform not supported
 #endif
 
-#if ASYNC_TCP_SSL_ENABLED
+#if ASYNC_TCP_SSL_ENABLED && !(defined(ESP8266) && ASYNC_TCP_SSL_BEARSSL)
 #include <tcp_axtls.h>
+#endif
+
+#if ASYNC_TCP_SSL_ENABLED
 #define SHA1_SIZE 20
 #endif
 
@@ -80,6 +84,9 @@ class AsyncMqttClient {
   AsyncMqttClient& onPublish(AsyncMqttClientInternals::OnPublishUserCallback callback);
 
   bool connected() const;
+  // Call from the sketch loop: on ESP8266 with TLS it flushes buffered records and runs the
+  // keepalive between transport polls; elsewhere it does nothing.
+  void loop();
   void connect();
   void disconnect(bool force = false);
   uint16_t subscribe(const char* topic, uint8_t qos);
@@ -95,6 +102,13 @@ class AsyncMqttClient {
   bool _connectPacketNotEnoughSpace;
   bool _disconnectOnPoll;
   bool _tlsBadFingerprint;
+  // DISCONNECT sent or a partial frame queued: write nothing more until the transport closes
+  bool _disconnecting = false;
+#if defined(ESP8266)
+  // Disconnect deferred while _onData() parses
+  bool _parsing = false;
+  bool _disconnectDeferred = false;
+#endif
   uint32_t _lastClientActivity;
   uint32_t _lastServerActivity;
   uint32_t _lastPingRequestTime;
@@ -120,6 +134,10 @@ class AsyncMqttClient {
 
 #if ASYNC_TCP_SSL_ENABLED
   std::vector<std::array<uint8_t, SHA1_SIZE>> _secureServerFingerprints;
+#endif
+#if defined(ESP8266) && ASYNC_TCP_SSL_ENABLED && ASYNC_TCP_SSL_BEARSSL
+  // BearSSL checks one pin per handshake; a rejected pin moves on to the next one
+  size_t _fingerprintIndex = 0;
 #endif
 
   std::vector<AsyncMqttClientInternals::OnConnectUserCallback> _onConnectUserCallbacks;
@@ -150,7 +168,7 @@ class AsyncMqttClient {
   // TCP
   void _onConnect(AsyncClient* client);
   void _onDisconnect(AsyncClient* client);
-  static void _onError(AsyncClient* client, int8_t error);
+  void _onError(AsyncClient* client, int8_t error);
   void _onTimeout(AsyncClient* client, uint32_t time);
   static void _onAck(AsyncClient* client, size_t len, uint32_t time);
   void _onData(AsyncClient* client, uint8_t* data, size_t len);
