@@ -380,8 +380,8 @@ void AsyncMqttClient::_onDisconnect(AsyncClient* client) {
 #if defined(ESP8266)
   // A callback run while parsing closed the transport; finish after parsing unwinds.
   // ESP8266 only: elsewhere the transport runs its callbacks on another task.
-  if (_parseState != PARSE_IDLE) {
-    _parseState = PARSE_DISCONNECT_DEFERRED;
+  if (_parsing) {
+    _disconnectDeferred = true;
     return;
   }
 #endif
@@ -433,7 +433,7 @@ void AsyncMqttClient::_onData(AsyncClient* client, uint8_t* data, size_t len) {
   // The transport hands over the rest of a received chain even after a callback closed it;
   // not connected(), which is false in CLOSE_WAIT while the broker's last bytes arrive
   if (client->disconnected()) return;
-  _parseState = PARSE_RUNNING;
+  _parsing = true;
 #else
   (void)client;
 #endif
@@ -503,10 +503,12 @@ void AsyncMqttClient::_onData(AsyncClient* client, uint8_t* data, size_t len) {
         currentBytePosition = len;
     }
 #if defined(ESP8266)
-  } while (currentBytePosition != len && _parseState != PARSE_DISCONNECT_DEFERRED);
-  const bool deferred = _parseState == PARSE_DISCONNECT_DEFERRED;
-  _parseState = PARSE_IDLE;
-  if (deferred) _onDisconnect(client);
+  } while (currentBytePosition != len && !_disconnectDeferred);
+  _parsing = false;
+  if (_disconnectDeferred) {
+    _disconnectDeferred = false;
+    _onDisconnect(client);
+  }
 #else
   } while (currentBytePosition != len);
 #endif

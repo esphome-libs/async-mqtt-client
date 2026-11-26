@@ -108,7 +108,7 @@ class AsyncMqttClient {
 
   char _generatedClientId[18 + 1];  // esp8266-abc123 and esp32-abcdef123456 
   // DISCONNECT sent or a partial frame queued: write nothing more until the transport closes.
-  // Here and below the flags fill alignment padding, so the class does not grow.
+  // This, _parsing and _disconnectDeferred each fill a padding byte, so the class does not grow.
   bool _disconnecting = false;
   IPAddress _ip;
   const char* _host;
@@ -119,6 +119,9 @@ class AsyncMqttClient {
   uint16_t _port;
   uint16_t _keepAlive;
   bool _cleanSession;
+#if defined(ESP8266)
+  bool _parsing = false;
+#endif
   const char* _clientId;
   const char* _username;
   const char* _password;
@@ -149,8 +152,8 @@ class AsyncMqttClient {
   char _remainingLengthBuffer[4];
 
 #if defined(ESP8266)
-  // _onData() is parsing; a disconnect seen meanwhile is deferred until it unwinds
-  enum : uint8_t { PARSE_IDLE, PARSE_RUNNING, PARSE_DISCONNECT_DEFERRED } _parseState = PARSE_IDLE;
+  // A disconnect seen while _onData() parses is deferred until it unwinds
+  bool _disconnectDeferred = false;
 #endif
   uint16_t _nextPacketId;
 
