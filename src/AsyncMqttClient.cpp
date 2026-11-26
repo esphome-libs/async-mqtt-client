@@ -974,26 +974,27 @@ uint16_t AsyncMqttClient::publish(const char* topic, uint8_t qos, bool retain, c
   }
 
   // The fields share one TLS record: the transport only seals a record when it is full or on send()
-#if defined(ESP8266)
-  // The ESP8266 transport keeps a reference to the data unless asked to copy it
-  auto add = [this](const char* data, size_t len) { return _client.add(data, len, ASYNC_WRITE_FLAG_COPY); };
-#else
-  auto add = [this](const char* data, size_t len) { return _client.add(data, len); };
-#endif
+  const struct {
+    const char* data;
+    size_t len;
+  } fields[] = {{fixedHeader, 1u + remainingLengthLength},
+                {topicLengthBytes, 2},
+                {topic, topicLength},
+                {packetIdBytes, qos != 0 ? 2u : 0u},
+                {payload, payload != nullptr ? payloadLength : 0u}};
   // Stop at the first short write so no field is queued without the ones before it
   size_t added = 0;
-  bool complete = true;
-  auto put = [&](const char* data, size_t len) {
-    if (!complete) return;
-    size_t taken = add(data, len);
+  for (const auto& field : fields) {
+    if (field.len == 0) continue;
+#if defined(ESP8266)
+    // The ESP8266 transport keeps a reference to the data unless asked to copy it
+    size_t taken = _client.add(field.data, field.len, ASYNC_WRITE_FLAG_COPY);
+#else
+    size_t taken = _client.add(field.data, field.len);
+#endif
     added += taken;
-    complete = taken == len;
-  };
-  put(fixedHeader, 1 + remainingLengthLength);
-  put(topicLengthBytes, 2);
-  put(topic, topicLength);
-  if (qos != 0) put(packetIdBytes, 2);
-  if (payload != nullptr) put(payload, payloadLength);
+    if (taken != field.len) break;
+  }
 #if defined(ESP8266)
   if (added != neededSpace) {
     // A partly queued packet corrupts the stream: stop writing and close

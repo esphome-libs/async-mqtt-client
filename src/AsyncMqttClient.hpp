@@ -102,18 +102,14 @@ class AsyncMqttClient {
   bool _connectPacketNotEnoughSpace;
   bool _disconnectOnPoll;
   bool _tlsBadFingerprint;
-  // DISCONNECT sent or a partial frame queued: write nothing more until the transport closes
-  bool _disconnecting = false;
-#if defined(ESP8266)
-  // Disconnect deferred while _onData() parses
-  bool _parsing = false;
-  bool _disconnectDeferred = false;
-#endif
   uint32_t _lastClientActivity;
   uint32_t _lastServerActivity;
   uint32_t _lastPingRequestTime;
 
   char _generatedClientId[18 + 1];  // esp8266-abc123 and esp32-abcdef123456 
+  // DISCONNECT sent or a partial frame queued: write nothing more until the transport closes.
+  // This, _parsing and _disconnectDeferred each fill a padding byte, so the class does not grow.
+  bool _disconnecting = false;
   IPAddress _ip;
   const char* _host;
   bool _useIp;
@@ -123,6 +119,9 @@ class AsyncMqttClient {
   uint16_t _port;
   uint16_t _keepAlive;
   bool _cleanSession;
+#if defined(ESP8266)
+  bool _parsing = false;
+#endif
   const char* _clientId;
   const char* _username;
   const char* _password;
@@ -152,6 +151,10 @@ class AsyncMqttClient {
   uint8_t _remainingLengthBufferPosition;
   char _remainingLengthBuffer[4];
 
+#if defined(ESP8266)
+  // A disconnect seen while _onData() parses is deferred until it unwinds
+  bool _disconnectDeferred = false;
+#endif
   uint16_t _nextPacketId;
 
   std::vector<AsyncMqttClientInternals::PendingPubRel> _pendingPubRels;
