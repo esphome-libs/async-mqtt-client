@@ -518,8 +518,13 @@ void AsyncMqttClient::_onPoll(AsyncClient* client) {
   if (!_connected) return;
   // How long a DISCONNECT may wait to be queued, then for the broker to close
   static constexpr uint32_t DISCONNECT_WAIT_MS = 5000;
+  // First, so keepalive cannot restart the wait; nothing else is written meanwhile
   if (_disconnecting) {
-    if (millis() - _lastClientActivity >= DISCONNECT_WAIT_MS) disconnect(true);
+    if (millis() - _lastClientActivity >= DISCONNECT_WAIT_MS) {
+      disconnect(true);
+    } else if (_disconnectOnPoll) {
+      _sendDisconnect();
+    }
     return;
   }
 
@@ -542,16 +547,6 @@ void AsyncMqttClient::_onPoll(AsyncClient* client) {
   // handle to send ack packets
 
   _sendAcks();
-
-  // handle disconnect
-
-  if (_disconnectOnPoll) {
-    if (millis() - _lastClientActivity >= DISCONNECT_WAIT_MS) {
-      disconnect(true);
-    } else {
-      _sendDisconnect();
-    }
-  }
 }
 
 /* MQTT */
@@ -755,7 +750,8 @@ void AsyncMqttClient::_sendAcks() {
 }
 
 bool AsyncMqttClient::_sendDisconnect() {
-  if (!_connected || _disconnecting) return true;
+  // Callers skip an attempt already made: disconnect() checks _disconnecting, _onPoll() _disconnectOnPoll
+  if (!_connected) return true;
 
   const uint8_t neededSpace = 2;
 
@@ -849,11 +845,12 @@ void AsyncMqttClient::disconnect(bool force) {
 
   if (force) {
     _client.close(true);
-  } else {
-    // No room for DISCONNECT yet (e.g. right after a large publish): retry from poll, up to
-    // DISCONNECT_WAIT_MS
-    _disconnectOnPoll = !_sendDisconnect();
-    if (_disconnectOnPoll) _lastClientActivity = millis();
+  } else if (!_disconnecting && !_sendDisconnect()) {
+    // No room for DISCONNECT yet (e.g. right after a large publish): write nothing else and
+    // retry from poll, up to DISCONNECT_WAIT_MS
+    _disconnecting = true;
+    _disconnectOnPoll = true;
+    _lastClientActivity = millis();
   }
 }
 
