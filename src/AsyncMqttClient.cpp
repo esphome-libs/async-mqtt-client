@@ -515,7 +515,13 @@ void AsyncMqttClient::_onData(AsyncClient* client, uint8_t* data, size_t len) {
 }
 
 void AsyncMqttClient::_onPoll(AsyncClient* client) {
-  if (!_connected || _disconnecting) return;
+  if (!_connected) return;
+  if (_disconnecting) {
+    // How long the broker gets to close after DISCONNECT or a partly queued packet
+    static constexpr uint32_t DISCONNECT_WAIT_MS = 5000;
+    if (millis() - _lastClientActivity >= DISCONNECT_WAIT_MS) disconnect(true);
+    return;
+  }
 
   if (_keepAlive == 0) {
     // Keepalive off (MQTT 3.1.1, 3.1.2.10): no pings and no ping timeout
@@ -765,10 +771,11 @@ bool AsyncMqttClient::_sendDisconnect() {
   // deferred, so check the transport too
   if (!_connected || _client.disconnected()) { SEMAPHORE_GIVE(); return true; }
 #if defined(ESP8266)
-  // Graceful: the transport sends TLS records still buffered before it closes.
-  // Stay connected until it does, but nothing more goes out after DISCONNECT.
+  // Wait for the broker to close (MQTT 3.1.1 3.14.4 lets it): mosquitto drops a DISCONNECT that
+  // arrives with the client's FIN, and reconnecting first lets a session takeover drop it.
+  // _onPoll() closes if the broker has not.
   _disconnecting = true;
-  _client.close(false);
+  _lastClientActivity = millis();
 #else
   _client.close(true);
 #endif
@@ -1002,6 +1009,7 @@ uint16_t AsyncMqttClient::publish(const char* topic, uint8_t qos, bool retain, c
     // A write that tore the connection down already ran _onDisconnect()
     if (added != 0 && _client.connected()) {
       _disconnecting = true;
+      _lastClientActivity = millis();
       _client.close();
     }
     SEMAPHORE_GIVE();
