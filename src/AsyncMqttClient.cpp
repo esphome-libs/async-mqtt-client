@@ -515,7 +515,18 @@ void AsyncMqttClient::_onData(AsyncClient* client, uint8_t* data, size_t len) {
 }
 
 void AsyncMqttClient::_onPoll(AsyncClient* client) {
-  if (!_connected || _disconnecting) return;
+  if (!_connected) return;
+  // How long a DISCONNECT may wait to be queued, then for the broker to close
+  static constexpr uint32_t DISCONNECT_WAIT_MS = 5000;
+  // First, so keepalive cannot restart the wait; nothing else is written meanwhile
+  if (_disconnecting) {
+    if (millis() - _lastClientActivity >= DISCONNECT_WAIT_MS) {
+      disconnect(true);
+    } else if (_disconnectOnPoll) {
+      _sendDisconnect();
+    }
+    return;
+  }
 
   if (_keepAlive == 0) {
     // Keepalive off (MQTT 3.1.1, 3.1.2.10): no pings and no ping timeout
@@ -536,12 +547,6 @@ void AsyncMqttClient::_onPoll(AsyncClient* client) {
   // handle to send ack packets
 
   _sendAcks();
-
-  // handle disconnect
-
-  if (_disconnectOnPoll) {
-    _sendDisconnect();
-  }
 }
 
 /* MQTT */
@@ -745,7 +750,8 @@ void AsyncMqttClient::_sendAcks() {
 }
 
 bool AsyncMqttClient::_sendDisconnect() {
-  if (!_connected || _disconnecting) return true;
+  // Callers skip an attempt already made: disconnect() checks _disconnecting, _onPoll() _disconnectOnPoll
+  if (!_connected) return true;
 
   const uint8_t neededSpace = 2;
 
@@ -759,16 +765,28 @@ bool AsyncMqttClient::_sendDisconnect() {
   fixedHeader[0] = fixedHeader[0] | AsyncMqttClientInternals::HeaderFlag.DISCONNECT_RESERVED;
   fixedHeader[1] = 0;
 
-  _client.add(fixedHeader, 2);
+#if defined(ESP8266)
+  // Last segment: Nagle can hold it until the forced close. The transport keeps a pointer unless copied.
+  _client.setNoDelay(true);
+  const size_t added = _client.add(fixedHeader, neededSpace, ASYNC_WRITE_FLAG_COPY);
+#else
+  const size_t added = _client.add(fixedHeader, neededSpace);
+#endif
   _client.send();
   // A failed write already tore the connection down; while parsing, onDisconnect is
   // deferred, so check the transport too
   if (!_connected || _client.disconnected()) { SEMAPHORE_GIVE(); return true; }
+  if (added != neededSpace) {
+    if (added) _client.close(true);  // half a packet corrupts the stream
+    SEMAPHORE_GIVE();
+    return added != 0;  // nothing taken: retry from poll
+  }
 #if defined(ESP8266)
-  // Graceful: the transport sends TLS records still buffered before it closes.
-  // Stay connected until it does, but nothing more goes out after DISCONNECT.
+  // Wait for the broker to close (MQTT 3.1.1 3.14.4 lets it): mosquitto drops a DISCONNECT that
+  // arrives with the client's FIN, and reconnecting first lets a session takeover drop it.
+  // _onPoll() closes if the broker has not.
   _disconnecting = true;
-  _client.close(false);
+  _lastClientActivity = millis();
 #else
   _client.close(true);
 #endif
@@ -827,9 +845,12 @@ void AsyncMqttClient::disconnect(bool force) {
 
   if (force) {
     _client.close(true);
-  } else {
-    // No room for DISCONNECT yet (e.g. right after a large publish): retry from poll
-    _disconnectOnPoll = !_sendDisconnect();
+  } else if (!_disconnecting && !_sendDisconnect()) {
+    // No room for DISCONNECT yet (e.g. right after a large publish): write nothing else and
+    // retry from poll, up to DISCONNECT_WAIT_MS
+    _disconnecting = true;
+    _disconnectOnPoll = true;
+    _lastClientActivity = millis();
   }
 }
 
@@ -1002,6 +1023,7 @@ uint16_t AsyncMqttClient::publish(const char* topic, uint8_t qos, bool retain, c
     // A write that tore the connection down already ran _onDisconnect()
     if (added != 0 && _client.connected()) {
       _disconnecting = true;
+      _lastClientActivity = millis();
       _client.close();
     }
     SEMAPHORE_GIVE();
