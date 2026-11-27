@@ -854,6 +854,11 @@ void AsyncMqttClient::disconnect(bool force) {
   }
 }
 
+void AsyncMqttClient::abort() {
+  // tcp_abort() sends the RST and runs _onDisconnect() before returning
+  _client.abort();
+}
+
 uint16_t AsyncMqttClient::subscribe(const char* topic, uint8_t qos) {
   if (!_connected || _disconnecting) return 0;
 
