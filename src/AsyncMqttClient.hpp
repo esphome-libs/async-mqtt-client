@@ -91,6 +91,8 @@ class AsyncMqttClient {
   void loop();
   void connect();
   void disconnect(bool force = false);
+  // Sends RST at once, dropping DISCONNECT and anything queued; for a restart, where a FIN can stay queued
+  void abort();
   uint16_t subscribe(const char* topic, uint8_t qos);
   uint16_t unsubscribe(const char* topic);
   uint16_t publish(const char* topic, uint8_t qos, bool retain, const char* payload = nullptr, size_t length = 0, bool dup = false, uint16_t message_id = 0);
@@ -121,9 +123,7 @@ class AsyncMqttClient {
   uint16_t _port;
   uint16_t _keepAlive;
   bool _cleanSession;
-#if defined(ESP8266)
   bool _parsing = false;
-#endif
   const char* _clientId;
   const char* _username;
   const char* _password;
@@ -153,10 +153,8 @@ class AsyncMqttClient {
   uint8_t _remainingLengthBufferPosition;
   char _remainingLengthBuffer[4];
 
-#if defined(ESP8266)
   // A disconnect seen while _onData() parses is deferred until it unwinds
   bool _disconnectDeferred = false;
-#endif
   uint16_t _nextPacketId;
 
   std::vector<AsyncMqttClientInternals::PendingPubRel> _pendingPubRels;
