@@ -765,7 +765,13 @@ bool AsyncMqttClient::_sendDisconnect() {
   fixedHeader[0] = fixedHeader[0] | AsyncMqttClientInternals::HeaderFlag.DISCONNECT_RESERVED;
   fixedHeader[1] = 0;
 
+#if defined(ESP8266)
+  // Last segment: Nagle can hold it until the forced close. The transport keeps a pointer unless copied.
+  _client.setNoDelay(true);
+  _client.add(fixedHeader, 2, ASYNC_WRITE_FLAG_COPY);
+#else
   _client.add(fixedHeader, 2);
+#endif
   _client.send();
   // A failed write already tore the connection down; while parsing, onDisconnect is
   // deferred, so check the transport too
