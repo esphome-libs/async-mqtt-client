@@ -84,6 +84,8 @@ class AsyncMqttClient {
   AsyncMqttClient& onPublish(AsyncMqttClientInternals::OnPublishUserCallback callback);
 
   bool connected() const;
+  // ESP8266: DISCONNECT sent or a write aborted; connected() stays true until TCP closes
+  bool disconnecting() const { return _disconnecting; }
   // Call from the sketch loop: on ESP8266 with TLS it flushes buffered records and runs the
   // keepalive between transport polls; elsewhere it does nothing.
   void loop();
