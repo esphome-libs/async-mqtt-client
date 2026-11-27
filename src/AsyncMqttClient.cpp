@@ -377,14 +377,12 @@ void AsyncMqttClient::_onConnect(AsyncClient* client) {
 }
 
 void AsyncMqttClient::_onDisconnect(AsyncClient* client) {
-#if defined(ESP8266)
-  // A callback run while parsing closed the transport; finish after parsing unwinds.
-  // ESP8266 only: elsewhere the transport runs its callbacks on another task.
+  // A callback run while parsing closed the transport (every transport's close(true) calls
+  // back at once); finish after parsing unwinds
   if (_parsing) {
     _disconnectDeferred = true;
     return;
   }
-#endif
   (void)client;
   AsyncMqttClientDisconnectReason reason;
 
@@ -429,14 +427,10 @@ void AsyncMqttClient::_onAck(AsyncClient* client, size_t len, uint32_t time) {
 
 void AsyncMqttClient::_onData(AsyncClient* client, uint8_t* data, size_t len) {
   size_t currentBytePosition = 0;
-#if defined(ESP8266)
-  // The transport hands over the rest of a received chain even after a callback closed it;
-  // not connected(), which is false in CLOSE_WAIT while the broker's last bytes arrive
-  if (client->disconnected()) return;
+  // The transport hands over the rest of a received chain after a callback closed it. state() is 0
+  // then on every transport; connected() is false in CLOSE_WAIT, disconnected() varies.
+  if (client->state() == 0) return;
   _parsing = true;
-#else
-  (void)client;
-#endif
   uint8_t currentByte;
   do {
     switch (_parsingInformation.bufferState) {
@@ -502,16 +496,12 @@ void AsyncMqttClient::_onData(AsyncClient* client, uint8_t* data, size_t len) {
       default:
         currentBytePosition = len;
     }
-#if defined(ESP8266)
   } while (currentBytePosition != len && !_disconnectDeferred);
   _parsing = false;
   if (_disconnectDeferred) {
     _disconnectDeferred = false;
     _onDisconnect(client);
   }
-#else
-  } while (currentBytePosition != len);
-#endif
 }
 
 void AsyncMqttClient::_onPoll(AsyncClient* client) {
@@ -773,9 +763,8 @@ bool AsyncMqttClient::_sendDisconnect() {
   const size_t added = _client.add(fixedHeader, neededSpace);
 #endif
   _client.send();
-  // A failed write already tore the connection down; while parsing, onDisconnect is
-  // deferred, so check the transport too
-  if (!_connected || _client.disconnected()) { SEMAPHORE_GIVE(); return true; }
+  // A failed write already tore the connection down, or deferred that while parsing
+  if (!_connected || _disconnectDeferred) { SEMAPHORE_GIVE(); return true; }
   if (added != neededSpace) {
     if (added) _client.close(true);  // half a packet corrupts the stream
     SEMAPHORE_GIVE();
@@ -855,7 +844,7 @@ void AsyncMqttClient::disconnect(bool force) {
 }
 
 void AsyncMqttClient::abort() {
-  // tcp_abort() sends the RST and runs _onDisconnect() before returning
+  // Sends the RST at once; _onDisconnect() follows when the transport reports it (deferred while parsing)
   _client.abort();
 }
 

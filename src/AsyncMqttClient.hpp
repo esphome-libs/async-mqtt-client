@@ -123,9 +123,7 @@ class AsyncMqttClient {
   uint16_t _port;
   uint16_t _keepAlive;
   bool _cleanSession;
-#if defined(ESP8266)
   bool _parsing = false;
-#endif
   const char* _clientId;
   const char* _username;
   const char* _password;
@@ -155,10 +153,8 @@ class AsyncMqttClient {
   uint8_t _remainingLengthBufferPosition;
   char _remainingLengthBuffer[4];
 
-#if defined(ESP8266)
   // A disconnect seen while _onData() parses is deferred until it unwinds
   bool _disconnectDeferred = false;
-#endif
   uint16_t _nextPacketId;
 
   std::vector<AsyncMqttClientInternals::PendingPubRel> _pendingPubRels;
